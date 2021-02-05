@@ -1,0 +1,373 @@
+---
+title: "Time Series Analysis Exam"
+author: "Mariano CRIMI"
+subtitle: Electricity Consumption Prediction
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+We start by loading necessary packages
+
+```{r}
+library(forecast)
+library(ggplot2)
+library(readxl)
+library(dplyr)
+library(tseries)
+library(urca)
+```
+We create a function to calculate the RMSE of our models
+```{r}
+#' RMSE
+#' Function to calculate the root mean square error
+#' @param actual ground truth values
+#' @param predicted values predicted by the model
+#' @return rmse
+rmse <- function(actual, predicted) {
+  return(sqrt(mean((predicted-actual)^2)))
+}
+```
+
+
+# Basic exploration and wrangling
+
+We read in the data from the working directory. We do a basic axploration to understand how the daily data is composed. 
+```{r}
+data <- read_excel("Elec-train.xlsx")
+data$Timestamp <- strptime(data$Timestamp, "%m/%d/%Y %H:%M")
+data <- mutate(data, Day = as.Date(Timestamp))
+data %>% group_by(Day) %>% summarise(no_rows = length(Day))
+```
+
+We have 48 days worth of data, with 96 samples each day (every 15 mins), with the exception of day 1, for which we only have 91 minutes. The series starts in the 6th quarter that day.
+
+With this information we can construct the time series object:
+
+```{r}
+#convert data into a time series object
+elec <- ts(data %>% select(2, 3), start=c(1,6),end=c(48,96), frequency=96)
+#setup column names
+colnames(elec) <- c("power","temp")
+```
+
+```{r}
+#Plot histograms
+hist(elec[,"power"])
+hist(elec[,"temp"])
+
+#Plot raw data
+autoplot(elec[,"power"])
+autoplot(elec[,"temp"])
+
+#Plot relationshipb between power and electricity
+plot(elec[,"temp"], elec[,"power"])
+```
+
+Now I look at the data from a seasonal perspective:
+
+```{r}
+#Seasonal plot
+ggseasonplot(elec[,"power"], ylab= 'Power (kW)', xlab = 'Quarter hour')
+ggseasonplot(elec[,"power"], ylab= 'Power (kW)', xlab = 'Quarter hour', polar=TRUE)
+ggseasonplot(elec[,"temp"], ylab= 'Temp', xlab = 'Quarter hour')
+```
+
+I then proceed to split the data into training and validation, in order to be able to choose the best model.
+
+```{r}
+#We take days 1 to 40 as our trining data
+elec_trn <- window(elec, start=c(1, 6), end=c(40,96))
+autoplot(elec_trn[,"power"])
+
+#We take days 40 to 47 as our validation data
+elec_test <- window(elec, start=c(41, 1), end=c(47,96))
+autoplot(elec_test[,"power"])
+```
+
+We take the temprature of day 48, so that we can include them as regressors in the final forecast
+
+```{r}
+f_reg_temp <- window(elec[,"temp"], start=c(48, 1), end=c(48,96))
+autoplot(f_reg_temp)
+```
+
+And finally I set up the horizon for the validation process.
+```{r}
+test_h = 7*96
+```
+
+# Modelization (without regressors)
+
+
+## Holt-Winters
+
+We start our analyis using exponential smoothing, trying both the additive and multiplicative seasonal factors and letting the function choose the optimal hyperparameters alpha, beta and gamma.
+
+```{r}
+#Setup and predict with additive seasonal effect
+hw_fitAdd <- HoltWinters(elec_trn[,"power"],alpha=NULL,beta=NULL,gamma=NULL, seasonal = "additive")
+hw_fitAdd_pred <- predict(hw_fitAdd,n.ahead=test_h)
+
+#Setup and predict with multiplicative seasonal effect
+hw_fitMult <- HoltWinters(elec_trn[,"power"],alpha=NULL,beta=NULL,gamma=NULL, seasonal = "multiplicative")
+hw_fitMult_pred <- predict(hw_fitMult,n.ahead=test_h)
+
+#Plot predictions against ground trouth
+autoplot (elec_test[,"power"]) +
+  autolayer(hw_fitAdd_pred, series='HW add.',PI=FALSE) +
+  autolayer(hw_fitMult_pred, series='HW mult.',PI=FALSE)
+
+#Calculate Errors
+rmse(elec_test[,"power"],hw_fitAdd_pred)
+rmse(elec_test[,"power"],hw_fitMult_pred)
+hw_fitAdd$test_rmse <- rmse(elec_test[,"power"],hw_fitAdd_pred)
+hw_fitMult$test_rmse <- rmse(elec_test[,"power"],hw_fitMult_pred)
+```
+
+The HW with multiplicative effect fit is not too bad, but we move forward to explore possible ARIMA models. First we decompose the serie to see if there's an stochastic part to be modeled
+
+```{r}
+elec_decomp  <- decompose(elec_trn[,"power"])
+autoplot(elec_decomp) + xlab('Time')
+hist(elec_decomp$random, main= "Residuals Distribution", xlab = "Residuals")
+Box.test(elec_decomp$random,type="Ljung-Box")
+```
+
+We see that we can we null hypothesis that the residuals can be defined as white noise so we proceed with an attempt to model them.
+
+## ARIMA
+
+
+I first start by trying an automatic ARIMA,
+
+```{r}
+autoarima_fit <- auto.arima(elec_trn[,"power"])
+autoarima_pred  <- forecast(autoarima_fit, h=test_h)
+
+autoplot (elec_test[,"power"], ylab = 'Power (kW)') +
+  autolayer(hw_fitAdd_pred, series='HW add.',PI=FALSE) +
+  autolayer(hw_fitMult_pred, series='HW mult.',PI=FALSE) +
+  autolayer(autoarima_pred, series='AutoArima',PI=FALSE)
+
+rmse(elec_test[,"power"],autoarima_pred$mean)
+autoarima_fit$test_rmse <- rmse(elec_test,autoarima_pred$mean)
+checkresiduals(autoarima_fit, plot= FALSE)
+```
+
+We see that the autorima picks up the seasonality and correctly differentiates to remove it. Then it finds an AR model for the non sesonal part. 
+
+The RMSE is better but quite similar to the one obtained by testing the HW multiplicative. It seems it would be worth exploring if another parameters for p,d and q would perform better.
+
+I now attempt a manual ARIMA. We first diffenciate our series by season in order to remove it:
+
+```{r}
+elec_diff_96 <- diff(elec_trn[,"power"], lag=96)
+```
+
+We then plot PACF and ACF for the differentiated series
+
+```{r}
+ggtsdisplay(elec_diff_96)
+```
+
+The series seems aproximately stationary, but we pefform the root unit test.
+
+```{r}
+elec_diff_96 %>% ur.kpss() %>% summary()
+```
+
+Indeed, the series is stationary but we see that the test statistic is much bigger than the 1% critical value.
+We are tempted to differentiate the series again:
+
+```{r}
+elec_diff_96 %>% diff() %>% ur.kpss() %>% summary()
+```
+
+This time it seems like the differentation really improve the significance value of the test, so we imagine that the model would benefit from 1 seasonal differentiation and 1 non seasonal differentiation. So we are tempted to try a non seasonal differntiation
+
+```{r}
+arima_fit <- Arima(elec_trn[,"power"], order= c(0,1,0), seasonal=c(0,1,0))
+arima_fit %>% residuals() %>% ggtsdisplay()
+```
+
+We now see a clear seasonal patterrn suggestive of an MA(1)96 with decay on the PACF and a single signicant value at 96
+
+```{r}
+arima_fit <- Arima(elec_trn[,"power"], order= c(0,1,0), seasonal=c(0,1,1))
+arima_fit %>% residuals() %>% ggtsdisplay()
+```
+
+It seems like this model capture the seasonal correlations well, but we still have quite significant lags in the non-seasonal part.
+
+There seems to be significance pattern in lag 4 an also a siginifcative lage at 7 with decay on the PACF, which might be suggestive of an MA(7)
+
+
+```{r}
+arima_fit <- Arima(elec_trn[,"power"], order= c(0,1,7), seasonal=c(0,1,1))
+arima_fit %>% residuals() %>% ggtsdisplay()
+```
+
+We see significance at lag 6 and 7. We can try an AR(6) for the nonseasonal part for simplicity
+
+```{r}
+arima_fit <- Arima(elec_trn[,"power"], order= c(6,1,7), seasonal=c(0,1,1))
+arima_fit %>% residuals() %>% ggtsdisplay()
+```
+
+I proceed to evaluate this last model in terms of RMSE and Boxtext:
+
+```{r}
+arima_pred  <- forecast(arima_fit, h=test_h)
+rmse(elec_test[,"power"],arima_pred$mean)
+checkresiduals(arima_fit)
+```
+
+It seems that we captured the initial lag correlations. There's still significant correlations, even at lag 95 but we chose not to model them as it would make the model too complicated.
+
+RMSE is quite good and the Box test is a little bit more acceptable. We proceed with this one as the manual baseline.
+
+We store the RMSE for further comparison.
+```{r}
+arima_pred$test_rmse <- rmse(elec_test[,"power"],arima_pred$mean)
+```
+
+
+We then plot the manual and auto SARIMA models:
+
+```{r}
+autoplot (elec_test[,"power"], ylab = 'Power (kW)') +
+  autolayer(autoarima_pred, series='AutoArima',PI=FALSE) +
+  autolayer(arima_pred, series='ManualArima',PI=FALSE) 
+```
+
+
+## Neural networks
+
+We now try some neural network models.
+
+We first attempt an automatic fit:
+
+```{r}
+#Auto
+auto_nn_fit=nnetar(elec_trn[,"power"])
+auto_nn_pred  <- forecast(auto_nn_fit, h=test_h)
+auto_nn_pred$test_rmse = rmse(elec_test[,"power"],auto_nn_pred$mean)
+auto_nn_pred$test_rmse
+
+```
+
+RMSE is quite bad.
+
+We now attempt a manual fitting.
+
+We force the non-sesonal lag to 7 and the sesonal lag to 96
+```{r}
+#Manual
+nn_fit=nnetar(elec_trn[,"power"], p=7, q=96)
+nn_pred  <- forecast(nn_fit, h=test_h)
+nn_fit$test_rmse = rmse(elec_test[,"power"],nn_pred$mean)
+nn_fit$test_rmse
+
+```
+RMSE is also quite bad.
+We plot the series for comparison:
+```{r}
+autoplot (elec_test[,"power"], ylab = 'Power (kW)') +
+  autolayer(nn_pred, series='AutoNN',PI=FALSE) +
+  autolayer(auto_nn_pred, series='NN',PI=FALSE) +
+  autolayer(arima_pred, series='SARIMA',PI=FALSE)
+```
+
+In both cases we have worst errors than with the manual arima, so we lean towards this model for the prediction without regressors
+
+```{r}
+summary(arima_fit)
+```
+
+# Modelization with regressors
+
+
+## Initial Analysis
+
+I now attempt to integrate the temperature regressor, for which I investigate the correlation between temperature and power:
+
+```{r}
+plot(elec_trn[,"temp"],elec_trn[,"power"], ylab = 'Power (kW)', xlab="Temperature", main='Correlation')
+cor(elec_trn[,"temp"], elec_trn[,"power"], method=c("pearson", "kendall", "spearman"))
+```
+
+There seems to be a valuable a correlation between the temperature and the power consumptions.
+
+## Neural Networks
+
+Having identify a correlation, we start by integrating them to the neural network model:
+
+```{r}
+nn_reg_fit <- nnetar(elec_trn[,"power"], p=7, q=96, xreg=elec_trn[,"temp"])
+nn_reg_pred  <- forecast(nn_reg_fit, h=test_h, xreg=elec_test[,"temp"] )
+nn_reg_fit$test_rmse <- rmse(elec_test[,"power"],nn_reg_pred$mean)
+nn_reg_fit$test_rmse
+```
+
+Still not very convincing. I come back to our prefered ARIMA model and introduce the regressors:
+```{r}
+arima_reg_fit  <- Arima(elec_trn[,"power"], order= c(6,1,7), seasonal=c(0,1,1), xreg=elec_trn[,'temp'])
+arima_reg_pred <- forecast(arima_reg_fit,h=test_h,xreg=elec_test[,'temp'])
+arima_reg_fit$test_rms <- rmse(elec_test["power"],arima_reg_pred$mean)
+
+checkresiduals(arima_reg_fit, plot=FALSE)
+rmse(elec_test[,"power"],arima_reg_pred$mean)
+```
+
+The regressors seem to improve the model. Next I plot the comparisson with our best model with and without regressors.
+
+```{r}
+autoplot (elec_test[,"power"], ylab = 'Power (kW)') +
+  autolayer(arima_reg_pred, series='A+temp',PI=FALSE) +
+  autolayer(arima_pred, series='A',PI=FALSE)
+```
+
+It seems also that the SARIMA fits a better model than neural networks when considering regressors.
+
+
+## Full training
+
+
+I now proceed retrain our SARIMA models using the full dataset:
+
+
+```{r Forecast}
+#Retraining with full dataset
+f_arima_fit <- Arima(elec[,"power"], order= c(6,1,7), seasonal=c(0,1,1))
+f_arima_pred <-forecast(f_arima_fit,h=96)
+
+#Get the temperature for the day 48
+f_temp <- window(elec[,"temp"], start=c(48, 1), end=c(48,96))
+
+#Predict day 48
+f_arima_reg_fit  <- Arima(elec[,"power"], order= c(6,1,7), seasonal=c(0,1,1), xreg=elec[,'temp'])
+f_arima_reg_pred <- forecast(f_arima_reg_fit,h=96,xreg=f_temp)
+
+```
+
+# Final prediction 
+
+Et voila les predictions:
+
+
+```{r}
+autoplot(window(elec[,"power"], start=c(45, 1), end=c(47,96)), ylab = 'Power (kW)') +
+  autolayer(f_arima_reg_pred, series='sarima w. temp',PI=FALSE) +
+  autolayer(f_arima_pred, series='sarima',PI=FALSE)
+
+f_arima_reg_pred
+f_arima_pred
+
+write.csv(f_arima_pred, file = 'f_arima_pred.csv')
+write.csv(f_arima_reg_pred, file = 'f_arima_reg_pred.csv')
+
+```
